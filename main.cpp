@@ -49,7 +49,21 @@ struct Request {
 // Cost = 10 ms base + 0.5 ms per item. Output = sum of each input.
 std::vector<float> RunModel(const std::vector<std::unique_ptr<Request>>& batch) {
   auto cost = std::chrono::microseconds(10000 + 500 * batch.size());
-  std::this_thread::sleep_for(cost);
+  auto deadline = Clock::now() + cost;
+
+  // Hybrid wait: this host's sleep_for() itself is quantized to ~10-20ms
+  // even with timeBeginPeriod(1) (measured directly), so a small margin
+  // isn't enough slack — sleep_for(cost - 2ms) still overshoots the
+  // deadline on ~80% of calls here. 12ms was empirically the smallest
+  // margin that landed on the exact deadline consistently (10/10 trials);
+  // sleep for the coarse majority, then spin against the clock for the rest.
+  constexpr auto kSpinMargin = std::chrono::milliseconds(12);
+  if (cost > kSpinMargin) {
+    std::this_thread::sleep_for(cost - kSpinMargin);
+  }
+  while (Clock::now() < deadline) {
+  }
+
   std::vector<float> outputs;
   for (const auto& r : batch) {
     float sum = 0;
