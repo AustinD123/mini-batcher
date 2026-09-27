@@ -37,6 +37,9 @@ struct WinTimerResolution {
 
 using Clock = std::chrono::steady_clock;
 
+// Largest batch the worker will assemble in one RunModel() call.
+constexpr size_t MAX_BATCH_SIZE = 8;
+
 // ---------- Request: what a "client" sends ----------
 struct Request {
   int id;
@@ -133,29 +136,26 @@ void LoadGenerator(RequestQueue& rq, Stats& stats, int rps, int seconds) {
 
 // ---------- Worker: YOUR CODE GOES HERE ----------
 void Worker(RequestQueue& rq) {
-  // STEP 1 TODO:
-  //   loop forever:
-  //     1. lock rq.mu and wait on rq.cv until the queue is non-empty OR shutdown
-  //     2. if shutdown and queue empty -> return
-  //     3. pop ONE request from the front (move the unique_ptr out)
-  //     4. UNLOCK before running the model (why? think about the producer)
-  //     5. build a batch vector containing just that request, call RunModel
-  //     6. call the request's callback with outputs[0]
   while (true) {
-    std::unique_ptr<Request> req;
+    std::vector<std::unique_ptr<Request>> batch;
     {
-      std::unique_lock<std::mutex> lk(rq.mu);
+      std::unique_lock<std::mutex> lk(rq.mu);   // lock acquired ONCE here
       rq.cv.wait(lk, [&rq] { return !rq.q.empty() || rq.shutdown; });
       if (rq.shutdown && rq.q.empty()) return;
-      req = std::move(rq.q.front());
-      rq.q.pop_front();
-    }
-    std::vector<std::unique_ptr<Request>> batch;
-    batch.push_back(std::move(req));
-    auto outputs = RunModel(batch);
-    batch[0]->callback(batch[0]->id, outputs[0]);
-  }
 
+      // Still holding the lock: these checks and pops are plain deque operations
+      while (batch.size() < MAX_BATCH_SIZE && !rq.q.empty()) {
+        batch.push_back(std::move(rq.q.front()));
+        rq.q.pop_front();
+      }
+    }                                            // lock released ONCE here
+
+    auto outputs = RunModel(batch);              // no lock held: producer keeps enqueuing
+
+    for (size_t i = 0; i < batch.size(); ++i) {
+      batch[i]->callback(batch[i]->id, outputs[i]);   // outputs[i] belongs to batch[i]
+    }
+  }
 }
 
 int main(int argc, char** argv) {
