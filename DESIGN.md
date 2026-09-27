@@ -169,3 +169,24 @@ This is a teaching-scale simplification of Triton's actual scheduler (no
 priority levels, no preferred-batch-size list, no per-model queue policies,
 no ragged-batch input handling) — the mapping is to the *shape* of the real
 design, not a claim of feature parity.
+
+## Correctness verification
+
+Two independent checks, both clean on every run:
+- **`completed == sent`**, checked at exit (loud stderr error if not).
+- **Per-id callback fire count == 1**, checked at exit against a
+  pre-sized `std::atomic<int>` array indexed by request id — catches a
+  dropped *and* a duplicated request even if they happened to cancel out in
+  the aggregate `completed`/`sent` totals.
+
+**ThreadSanitizer**: this repo targets MinGW g++ on Windows, which doesn't
+ship TSan, so the check ran under WSL2 Ubuntu (`g++ 13.3.0`,
+`-fsanitize=thread -O1 -g`). TSan's runtime failed to start under WSL2's
+default ASLR (`ThreadSanitizer: unexpected memory mapping`) — a known
+WSL2/sanitizer interaction, not specific to this program — and needed
+`setarch $(uname -m) -R` (disables ASLR for the child process) to run at
+all. With that, four stress runs came back with **zero race reports**:
+4 instances / 300 rps / 5s, 8 instances / 600 rps / 5s (low delay, to force
+heavy concurrent batch execution), and the shutdown-forces-dispatch edge
+case (a 5000-second delay against a 1-second run, 4 instances) — all three
+completed 100% of requests with no dropped/duplicated ids either.
