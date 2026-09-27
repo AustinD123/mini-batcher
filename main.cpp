@@ -1,5 +1,5 @@
 // mini_batcher.cpp — a tiny dynamic batcher, built step by step.
-// Build: g++ -std=c++17 -O2 -pthread mini_batcher.cpp -o mini_batcher
+// Build: g++ -std=c++17 -O2 -pthread mini_batcher.cpp -o mini_batcher (add -lwinmm on Windows)
 // Run:   ./mini_batcher <requests_per_second> <duration_seconds>
 //
 // STEP 1 (now): one worker thread, NO batching. Pop one request, run the
@@ -21,6 +21,19 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+// RAII wrapper: Windows' default timer resolution is ~15.6ms, which is
+// coarse enough to distort both sleep_until() and our latency measurements.
+// timeBeginPeriod(1) requests 1ms resolution for the process; the matching
+// timeEndPeriod(1) on destruction restores the system default, and using
+// RAII means it fires on every exit path (including the early return below).
+struct WinTimerResolution {
+  WinTimerResolution() { timeBeginPeriod(1); }
+  ~WinTimerResolution() { timeEndPeriod(1); }
+};
+#endif
 
 using Clock = std::chrono::steady_clock;
 
@@ -64,16 +77,29 @@ struct Stats {
 // ---------- Load generator: plays the role of the HTTP thread ----------
 void LoadGenerator(RequestQueue& rq, Stats& stats, int rps, int seconds) {
   auto interval = std::chrono::microseconds(1000000 / rps);
-  auto end = Clock::now() + std::chrono::seconds(seconds);
+  auto start = Clock::now();
+  auto end = start + std::chrono::seconds(seconds);
   int next_id = 0;
-  while (Clock::now() < end) {
+  while (true) {
+    // Absolute schedule: target time for request i is start + i * interval,
+    // not "now + interval". This keeps the send rate accurate even if a
+    // single sleep overshoots — sleep_for would let each overshoot compound
+    // (drift), while recomputing from `start` each time cannot drift.
+    auto target = start + next_id * interval;
+    if (target >= end) break;
+    if (Clock::now() < target) {
+      std::this_thread::sleep_until(target);
+    }
+    // else: already behind schedule — send immediately to catch up instead
+    // of pushing every subsequent request later still.
+
     auto req = std::make_unique<Request>();
     req->id = next_id++;
     req->input = {1.0f, 2.0f, 3.0f};
     req->enqueue_time = Clock::now();
-    auto start = req->enqueue_time;
-    req->callback = [&stats, start](int /*id*/, float /*output*/) {
-      double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    auto req_start = req->enqueue_time;
+    req->callback = [&stats, req_start](int /*id*/, float /*output*/) {
+      double ms = std::chrono::duration<double, std::milli>(Clock::now() - req_start).count();
       std::lock_guard<std::mutex> lk(stats.mu);
       stats.latencies_ms.push_back(ms);
       stats.completed++;
@@ -83,7 +109,6 @@ void LoadGenerator(RequestQueue& rq, Stats& stats, int rps, int seconds) {
       rq.q.push_back(std::move(req));
     }
     rq.cv.notify_one();
-    std::this_thread::sleep_for(interval);
   }
   {
     std::lock_guard<std::mutex> lk(rq.mu);
@@ -120,6 +145,9 @@ void Worker(RequestQueue& rq) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
+  WinTimerResolution timer_resolution;
+#endif
   int rps = argc > 1 ? std::atoi(argv[1]) : 50;
   int seconds = argc > 2 ? std::atoi(argv[2]) : 3;
 
